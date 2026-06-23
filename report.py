@@ -51,6 +51,13 @@ _SPECIAL_STATS = {
     "subnet_count", "orphaned_subnet_count",
     "frs_subscriber_count", "dfsr_subscriber_count", "sysvol_using_frs",
     "rbcd_on_domain_object", "rbcd_on_dc_count",
+    # new – checks 36–41
+    "gmsas_total", "gmsas_with_risky_acls",
+    "admincount_total", "admincount_orphaned", "admincount_stale",
+    "domain_trusts_total", "trusts_weak_auth", "trusts_transitive",
+    "bitlocker_recovery_keys_in_ad", "bitlocker_keys_risky_acl",
+    "dns_zones_found", "wildcard_dns_records", "site_links", "sitelinks_risky_interval",
+    "certificate_templates_total", "esc12_templates",
 }
 
 _FINDINGS_COLGROUP = """

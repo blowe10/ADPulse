@@ -4374,6 +4374,651 @@ def check_rbcd_on_domain(ad: ADConnector) -> Tuple[List[F], Dict]:
     return findings, stats
 
 
+# -- 36. gMSA ACL Exposure Detection -------------------------------------------
+
+
+def check_gmsas_acl_exposure(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] gMSA ACL Exposure Detection")
+    
+    # Query for group managed service accounts
+    gmsas = ad.search(
+        "(objectClass=msDS-GroupManagedServiceAccount)",
+        ["cn", "distinguishedName", "nTSecurityDescriptor", "msDS-GroupMSAMembership"],
+    )
+    
+    stats["gmsas_total"] = len(gmsas)
+    
+    if not gmsas:
+        findings.append(
+            F(
+                "Service Accounts",
+                "No Group Managed Service Accounts (gMSA) Found",
+                "INFO",
+                "No gMSAs detected in the domain.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    domain_sid = _get_domain_sid(ad)
+    risky_gmsas = []
+    
+    # Check each gMSA for overly permissive ACLs
+    for gm in gmsas:
+        gm_name = ad.attr_str(gm, "cn")
+        gm_dn = ad.attr_str(gm, "distinguishedName")
+        
+        try:
+            # Fetch the full SD for this gMSA
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=gm_dn,
+                search_filter="(objectClass=msDS-GroupManagedServiceAccount)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            risky_aces = []
+            
+            for ace in aces:
+                if ace["ace_type"] not in (0x00, 0x05, 0x06):  # Allow, Allowed object, Denied object
+                    continue
+                
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                # Flag if non-privileged principals have write access to gMSA
+                if not _sid_is_privileged(sid, domain_sid):
+                    if mask & (AM_GENERIC_ALL | AM_GENERIC_WRITE | AM_WRITE_PROP):
+                        resolved = ad.resolve_sid(sid)
+                        risky_aces.append(f"{resolved} (mask: 0x{mask:08x})")
+            
+            if risky_aces:
+                risky_gmsas.append((gm_name, risky_aces))
+        
+        except Exception as e:
+            print(f"  [~] gMSA ACL check failed for {gm_name}: {e}")
+            continue
+    
+    stats["gmsas_with_risky_acls"] = len(risky_gmsas)
+    
+    if risky_gmsas:
+        details = []
+        for gm_name, aces in risky_gmsas:
+            details.append(f"{gm_name}: {', '.join(aces)}")
+        
+        findings.append(
+            F(
+                "Service Accounts",
+                "gMSA with Overly Permissive ACLs",
+                "HIGH",
+                f"{len(risky_gmsas)} gMSA(s) allow non-privileged principals to read/modify passwords.",
+                details=details,
+                recommendation="Review and restrict gMSA ACLs to authorized service accounts only.",
+                risk_score=15,
+                references=[
+                    "https://docs.microsoft.com/en-us/windows-server/security/group-managed-service-accounts/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Service Accounts",
+                "gMSA ACLs Properly Restricted",
+                "INFO",
+                f"{len(gmsas)} gMSA(s) have appropriate access restrictions.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 37. PIM Gaps / AdminSDHolder Enforcement Verification ----------------------
+
+
+def check_pim_gaps_adminsdholder(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] PIM Gaps / AdminSDHolder Enforcement")
+    
+    # Get all accounts with adminCount=1
+    admin_count_accounts = ad.search(
+        "(&(objectClass=user)(adminCount=1))",
+        ["sAMAccountName", "distinguishedName", "userAccountControl", "lastLogonTimestamp"],
+    )
+    
+    stats["admincount_total"] = len(admin_count_accounts)
+    
+    if not admin_count_accounts:
+        findings.append(
+            F(
+                "Privileged Identity Management",
+                "No AdminCount=1 Accounts Found",
+                "INFO",
+                "No accounts marked as protected admins.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    # Get actual privileged group membership
+    priv_groups = {
+        "Domain Admins": f"CN=Domain Admins,CN=Users,{ad.base_dn}",
+        "Enterprise Admins": f"CN=Enterprise Admins,CN=Users,{ad.base_dn}",
+        "Schema Admins": f"CN=Schema Admins,CN=Users,{ad.base_dn}",
+        "Administrators": f"CN=Administrators,CN=Builtin,{ad.base_dn}",
+    }
+    
+    actual_admins = set()
+    for group_dn in priv_groups.values():
+        members = ad.search(
+            f"(&(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:={group_dn}))",
+            ["distinguishedName"],
+        )
+        actual_admins.update(ad.attr_str(m, "distinguishedName") for m in members)
+    
+    # Find ghost admins (adminCount=1 but not in any priv group)
+    ghost_admins = []
+    stale_admins = []
+    
+    for acc in admin_count_accounts:
+        dn = ad.attr_str(acc, "distinguishedName")
+        name = ad.attr_str(acc, "sAMAccountName")
+        uac = ad.attr_int(acc, "userAccountControl")
+        llt = _ldap_ts_to_dt(_attr_raw(acc, "lastLogonTimestamp"))
+        
+        if dn not in actual_admins:
+            ghost_admins.append(f"{name} ({dn[:60]}...)")
+        
+        if uac & UAC_DISABLED:
+            ghost_admins.append(f"{name} (disabled)")
+        
+        days_inactive = _days_since(llt)
+        if days_inactive and days_inactive > 90:
+            stale_admins.append(f"{name} ({days_inactive}d inactive)")
+    
+    stats["admincount_orphaned"] = len(ghost_admins)
+    stats["admincount_stale"] = len(stale_admins)
+    
+    if ghost_admins:
+        findings.append(
+            F(
+                "Privileged Identity Management",
+                "Orphaned AdminCount=1 Accounts",
+                "HIGH",
+                f"{len(ghost_admins)} account(s) marked as admin but not in privileged groups. "
+                "These are artifacts of removed admins that still hold protection flags.",
+                details=ghost_admins,
+                recommendation="Remove adminCount flag from non-privileged accounts via: Set-ADUser -adminCount $false",
+                risk_score=12,
+            )
+        )
+    
+    if stale_admins:
+        findings.append(
+            F(
+                "Privileged Identity Management",
+                "Stale Privileged Accounts (>90 days inactive)",
+                "HIGH",
+                f"{len(stale_admins)} admin account(s) have not logged in for 90+ days.",
+                details=stale_admins,
+                recommendation="Disable or remove stale admin accounts. Review break-glass procedures.",
+                risk_score=12,
+            )
+        )
+    
+    if not ghost_admins and not stale_admins:
+        findings.append(
+            F(
+                "Privileged Identity Management",
+                "AdminCount=1 Accounts Properly Maintained",
+                "INFO",
+                f"All {len(admin_count_accounts)} admin accounts are current and associated with privilege groups.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 38. Weak Domain Trust Authentication Methods --------------------------------
+
+
+def check_weak_domain_trusts(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Weak Domain Trust Authentication")
+    
+    # Query all domain trusts
+    trusts = ad.search(
+        "(objectClass=trustedDomain)",
+        ["cn", "trustAttributes", "trustDirection", "trustType", "distinguishedName"],
+    )
+    
+    stats["domain_trusts_total"] = len(trusts)
+    
+    if not trusts:
+        findings.append(
+            F(
+                "Domain Trusts",
+                "No Domain Trusts Found",
+                "INFO",
+                "No external domain trusts detected.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    weak_trusts = []
+    transitive_trusts = []
+    
+    for trust in trusts:
+        trust_name = ad.attr_str(trust, "cn")
+        trust_attrs = ad.attr_int(trust, "trustAttributes")
+        trust_dir = ad.attr_int(trust, "trustDirection")
+        trust_type = ad.attr_int(trust, "trustType")
+        
+        # Trust attribute flags
+        TRUST_TRANSITIVE = 0x00000001
+        TRUST_UPLEVEL = 0x00000002
+        TRUST_DOWNLEVEL = 0x00000004
+        TRUST_INTRA_FOREST = 0x00000008
+        TRUST_FOREST_TRANSITIVE = 0x00000020
+        TRUST_QUARANTINED_DOMAIN = 0x00000040
+        TRUST_WITH_IN_FOREST = 0x00000020
+        TRUST_TRANSITIVE_TRUST = 0x00000001
+        
+        # Trust direction: 3=bidirectional, 2=outbound, 1=inbound
+        is_bidirectional = trust_dir == 3
+        is_transitive = bool(trust_attrs & TRUST_TRANSITIVE)
+        
+        # Flag weak auth: bidirectional trusts without SID filtering
+        if is_bidirectional and not (trust_attrs & TRUST_QUARANTINED_DOMAIN):
+            weak_trusts.append(
+                f"{trust_name} (bidirectional, transitive={is_transitive}, quarantined={bool(trust_attrs & TRUST_QUARANTINED_DOMAIN)})"
+            )
+        
+        if is_transitive:
+            transitive_trusts.append(trust_name)
+    
+    stats["trusts_weak_auth"] = len(weak_trusts)
+    stats["trusts_transitive"] = len(transitive_trusts)
+    
+    if weak_trusts:
+        findings.append(
+            F(
+                "Domain Trusts",
+                "Bidirectional Trusts Without Quarantine",
+                "HIGH",
+                f"{len(weak_trusts)} bidirectional trust(s) may allow cross-domain privilege escalation.",
+                details=weak_trusts,
+                recommendation=(
+                    "Enable SID filtering on external trusts or convert to one-way trusts. "
+                    "For forest trusts, ensure selective authentication is enforced."
+                ),
+                risk_score=15,
+                references=[
+                    "https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-trusts"
+                ],
+            )
+        )
+    
+    if transitive_trusts:
+        findings.append(
+            F(
+                "Domain Trusts",
+                "Transitive Domain Trusts Detected",
+                "MEDIUM",
+                f"{len(transitive_trusts)} transitive trust(s) allow auth to flow across domains.",
+                details=transitive_trusts,
+                recommendation="Audit trust necessity; convert to non-transitive where possible.",
+                risk_score=8,
+            )
+        )
+    
+    if not weak_trusts and not transitive_trusts:
+        findings.append(
+            F(
+                "Domain Trusts",
+                "Domain Trusts Properly Configured",
+                "INFO",
+                f"All {len(trusts)} trust(s) use secure authentication methods.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 39. BitLocker Recovery Key Storage in LDAP ----------------------------------
+
+
+def check_bitlocker_recovery_keys(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] BitLocker Recovery Key Storage")
+    
+    # Query for BitLocker recovery keys stored in AD
+    recovery_keys = ad.search(
+        "(objectClass=msFVE-RecoveryInformation)",
+        ["cn", "distinguishedName", "msFVE-RecoveryPassword"],
+    )
+    
+    stats["bitlocker_recovery_keys_in_ad"] = len(recovery_keys)
+    
+    if not recovery_keys:
+        findings.append(
+            F(
+                "Encryption",
+                "No BitLocker Recovery Keys Found in LDAP",
+                "INFO",
+                "BitLocker recovery keys are not stored in Active Directory (good practice).",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    # Check ACLs on recovery key containers to see if they're world-readable
+    risky_containers = []
+    
+    for key in recovery_keys:
+        key_dn = ad.attr_str(key, "distinguishedName")
+        
+        try:
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=key_dn,
+                search_filter="(objectClass=msFVE-RecoveryInformation)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            
+            for ace in aces:
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                # Flag if Everyone, Authenticated Users, or Domain Users can read keys
+                if sid in (_EVERYONE, _AUTH_USERS, f"{_get_domain_sid(ad)}-513"):
+                    if mask & (AM_GENERIC_ALL | AM_GENERIC_READ | AM_WRITE_PROP):
+                        risky_containers.append(key_dn)
+                        break
+        
+        except Exception as e:
+            print(f"  [~] BitLocker key ACL check failed for {key_dn[:60]}: {e}")
+            continue
+    
+    stats["bitlocker_keys_risky_acl"] = len(risky_containers)
+    
+    if risky_containers:
+        findings.append(
+            F(
+                "Encryption",
+                "BitLocker Recovery Keys with Overly Permissive ACLs",
+                "CRITICAL",
+                f"{len(risky_containers)} BitLocker recovery key container(s) are readable by non-admin users. "
+                "Recovery passwords should be restricted to DAs and approved recovery personnel only.",
+                details=risky_containers[:5],
+                recommendation=(
+                    "Restrict ACLs on msFVE-RecoveryInformation containers. "
+                    "Consider not storing recovery keys in LDAP at all for sensitive machines."
+                ),
+                risk_score=20,
+                references=[
+                    "https://docs.microsoft.com/en-us/windows/security/information-protection/bitlocker/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Encryption",
+                "BitLocker Recovery Keys Properly Protected",
+                "INFO",
+                f"{len(recovery_keys)} BitLocker recovery key(s) have restricted access.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 40. LLMNR/mDNS Boundary Misconfiguration ------------------------------------
+
+
+def check_llmnr_mdns_boundary(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] LLMNR/mDNS Boundary Misconfiguration")
+    
+    # Check for misconfigured DNS records that might enable name spoofing
+    # Query for wildcard DNS records
+    dnsroot_query = ad.search(
+        "(objectClass=dnsZone)",
+        ["cn", "distinguishedName"],
+        base=f"CN=MicrosoftDNS,CN=System,{ad.base_dn}",
+    )
+    
+    stats["dns_zones_found"] = len(dnsroot_query)
+    
+    wildcard_records = []
+    
+    for zone in dnsroot_query:
+        zone_name = ad.attr_str(zone, "cn")
+        zone_dn = ad.attr_str(zone, "distinguishedName")
+        
+        # Look for wildcard (*) records in each zone
+        try:
+            wildcard_nodes = ad.search(
+                "(name=*)",
+                ["cn", "objectClass", "dnsRecord"],
+                base=zone_dn,
+            )
+            
+            for node in wildcard_nodes:
+                node_name = ad.attr_str(node, "cn")
+                if "*" in node_name:
+                    wildcard_records.append(f"{zone_name}: {node_name}")
+        except Exception:
+            pass
+    
+    stats["wildcard_dns_records"] = len(wildcard_records)
+    
+    # Check site link replication intervals that might route across untrusted boundaries
+    sitelinks = ad.search(
+        "(objectClass=siteLink)",
+        ["cn", "replInterval", "siteList"],
+        base=f"CN=Sites,CN=Configuration,{ad.config_dn}",
+    )
+    
+    stats["site_links"] = len(sitelinks)
+    risky_intervals = []
+    
+    for link in sitelinks:
+        link_name = ad.attr_str(link, "cn")
+        interval = ad.attr_int(link, "replInterval")
+        
+        # Very low replication intervals across boundaries can indicate misconfiguration
+        if interval < 5:
+            risky_intervals.append(f"{link_name} (interval: {interval} min)")
+    
+    stats["sitelinks_risky_interval"] = len(risky_intervals)
+    
+    if wildcard_records:
+        findings.append(
+            F(
+                "Network & Infrastructure",
+                "Wildcard DNS Records Detected",
+                "MEDIUM",
+                f"{len(wildcard_records)} wildcard DNS record(s) could enable name spoofing attacks.",
+                details=wildcard_records,
+                recommendation="Review and remove unnecessary wildcard records. Use specific names instead.",
+                risk_score=10,
+            )
+        )
+    
+    if risky_intervals:
+        findings.append(
+            F(
+                "Network & Infrastructure",
+                "Aggressive Replication Intervals",
+                "LOW",
+                f"{len(risky_intervals)} site link(s) have very short replication intervals.",
+                details=risky_intervals,
+                recommendation="Ensure short intervals are intentional; consider security impact of WAN exposure.",
+                risk_score=3,
+            )
+        )
+    
+    if not wildcard_records and not risky_intervals:
+        findings.append(
+            F(
+                "Network & Infrastructure",
+                "LLMNR/mDNS Boundary Configuration Acceptable",
+                "INFO",
+                "No obvious LLMNR/mDNS misconfigurations detected.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 41. ESC12 - Temporary Certificate Flags in Templates --------------------------
+
+
+def check_esc12_temporary_certs(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] ESC12 - Temporary Certificate Flags")
+    
+    pki_base = f"CN=Public Key Services,CN=Services,{ad.config_dn}"
+    tmpl_base = f"CN=Certificate Templates,{pki_base}"
+    
+    # First check if ADCS exists
+    try:
+        tmpl_search = ad.search(
+            "(objectClass=pKICertificateTemplate)",
+            ["cn"],
+            base=tmpl_base,
+        )
+    except Exception:
+        findings.append(
+            F(
+                "ADCS",
+                "ADCS Not Accessible or Not Found",
+                "INFO",
+                "Certificate Services infrastructure not detected or not accessible.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    if not tmpl_search:
+        findings.append(
+            F(
+                "ADCS",
+                "No Certificate Templates Found",
+                "INFO",
+                "ADCS environment exists but no templates found.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    # Query templates for dangerous temporary cert flags
+    templates = ad.search(
+        "(objectClass=pKICertificateTemplate)",
+        [
+            "cn",
+            "msPKI-Template-Schema-Version",
+            "msPKI-Private-Key-Flag",
+            "msPKI-Enrollment-Flag",
+            "distinguishedName",
+        ],
+        base=tmpl_base,
+    )
+    
+    stats["certificate_templates_total"] = len(templates)
+    
+    # msPKI-Private-Key-Flag bit 0x00000002 = CT_FLAG_TEMPORARY (allows temporary cert generation)
+    CT_FLAG_TEMPORARY = 0x00000002
+    
+    esc12_templates = []
+    
+    for tmpl in templates:
+        tmpl_name = ad.attr_str(tmpl, "cn")
+        
+        # Skip CA and admin templates
+        if tmpl_name in _CA_TYPE_TEMPLATES:
+            continue
+        
+        priv_key_flags = ad.attr_int(tmpl, "msPKI-Private-Key-Flag")
+        
+        if priv_key_flags & CT_FLAG_TEMPORARY:
+            esc12_templates.append(tmpl_name)
+    
+    stats["esc12_templates"] = len(esc12_templates)
+    
+    if esc12_templates:
+        findings.append(
+            F(
+                "ADCS",
+                "ESC12 - Temporary Certificate Generation Enabled",
+                "HIGH",
+                f"{len(esc12_templates)} template(s) allow temporary certificate generation. "
+                "This can bypass CA approval workflows and enable unauthorized certificate issuance.",
+                details=esc12_templates,
+                recommendation=(
+                    "Disable the 'TEMPORARY' flag on all sensitive templates. "
+                    "Review legitimate uses of temporary certificates."
+                ),
+                risk_score=15,
+                references=[
+                    "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "ADCS",
+                "No ESC12 - Temporary Certificate Flags Detected",
+                "INFO",
+                f"None of {len(templates)} certificate template(s) allow temporary generation.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AGGREGATOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4409,7 +5054,7 @@ def run_all_checks(ad: ADConnector):
         check_exchange,
         check_admin_count,
         check_passwords_in_descriptions,
-        # New 11
+        # New 11 (checks 25-35)
         check_gpp_passwords,
         check_adminsdholder,
         check_sid_history,
@@ -4421,6 +5066,13 @@ def run_all_checks(ad: ADConnector):
         check_orphaned_subnets,
         check_frs_replication,
         check_rbcd_on_domain,
+        # New 6 (checks 36-41)
+        check_gmsas_acl_exposure,
+        check_pim_gaps_adminsdholder,
+        check_weak_domain_trusts,
+        check_bitlocker_recovery_keys,
+        check_llmnr_mdns_boundary,
+        check_esc12_temporary_certs,
     ]
 
     for fn in checks:
