@@ -58,6 +58,23 @@ _SPECIAL_STATS = {
     "bitlocker_recovery_keys_in_ad", "bitlocker_keys_risky_acl",
     "dns_zones_found", "wildcard_dns_records", "site_links", "sitelinks_risky_interval",
     "certificate_templates_total", "esc12_templates",
+    # Phase 1 (checks 43-46, 51-52)
+    "cert_templates_total", "cert_templates_with_write",
+    "operator_group_backup_operators", "operator_group_server_operators",
+    "operator_group_print_operators", "operator_group_account_operators",
+    "operator_group_risky_members",
+    "nested_group_paths",
+    "users_with_ldap_passwords",
+    "templates_no_approval",
+    "disabled_default_gpos",
+    # Phase 2 (checks 42, 47-49)
+    "computers_total", "computers_with_risky_acl",
+    "containers_total", "containers_with_generic_write",
+    "computers_checked", "computers_old_passwords",
+    "disabled_admin_accounts", "disabled_admin_stale", "disabled_admin_recent",
+    # Phase 3 (checks 50, 53)
+    "gpos_total", "gpos_with_write_acl",
+    "aad_connect_accounts_total", "aad_connect_accounts_found", "aad_connect_risky_perms",
 }
 
 _FINDINGS_COLGROUP = """

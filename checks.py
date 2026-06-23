@@ -5019,6 +5019,1087 @@ def check_esc12_temporary_certs(ad: ADConnector) -> Tuple[List[F], Dict]:
     return findings, stats
 
 
+# -- 43. Certificate Template Write ACL (ESC4 Equivalent) -----------------------
+
+
+def check_cert_template_write_acl(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Certificate Template Write ACL")
+    
+    pki_base = f"CN=Public Key Services,CN=Services,{ad.config_dn}"
+    tmpl_base = f"CN=Certificate Templates,{pki_base}"
+    
+    try:
+        templates = ad.search(
+            "(objectClass=pKICertificateTemplate)",
+            ["cn", "distinguishedName"],
+            base=tmpl_base,
+        )
+    except Exception:
+        findings.append(
+            F(
+                "ADCS",
+                "ADCS Not Accessible",
+                "INFO",
+                "Certificate Services infrastructure not detected.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    if not templates:
+        findings.append(
+            F(
+                "ADCS",
+                "No Certificate Templates Found",
+                "INFO",
+                "ADCS environment exists but no templates found.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    stats["cert_templates_total"] = len(templates)
+    domain_sid = _get_domain_sid(ad)
+    risky_templates = []
+    
+    for tmpl in templates:
+        tmpl_name = ad.attr_str(tmpl, "cn")
+        tmpl_dn = ad.attr_str(tmpl, "distinguishedName")
+        
+        if tmpl_name in _CA_TYPE_TEMPLATES:
+            continue
+        
+        try:
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=tmpl_dn,
+                search_filter="(objectClass=pKICertificateTemplate)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            
+            for ace in aces:
+                if ace["ace_type"] not in (0x00, 0x05, 0x06):
+                    continue
+                
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                if not _sid_is_privileged(sid, domain_sid):
+                    if mask & (AM_GENERIC_ALL | AM_GENERIC_WRITE | AM_WRITE_PROP):
+                        resolved = ad.resolve_sid(sid)
+                        risky_templates.append(f"{tmpl_name} → {resolved}")
+                        break
+        
+        except Exception as e:
+            print(f"  [~] Template ACL check failed for {tmpl_name}: {e}")
+            continue
+    
+    stats["cert_templates_with_write"] = len(risky_templates)
+    
+    if risky_templates:
+        findings.append(
+            F(
+                "ADCS",
+                "ESC4 - Certificate Templates with Write ACL",
+                "CRITICAL",
+                f"{len(risky_templates)} template(s) allow non-admin principals to modify settings. "
+                "This enables privilege escalation via template modification.",
+                details=risky_templates,
+                recommendation="Restrict template ACLs to CA operators and Domain Admins only.",
+                risk_score=18,
+                references=[
+                    "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "ADCS",
+                "Certificate Templates Properly Protected",
+                "INFO",
+                f"All {len(templates)} certificate template(s) have secure ACLs.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 44. Operator Group Membership -----------------------------------------------
+
+
+def check_operator_groups(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Operator Group Membership")
+    
+    operator_groups = {
+        "Backup Operators": f"CN=Backup Operators,CN=Builtin,{ad.base_dn}",
+        "Server Operators": f"CN=Server Operators,CN=Builtin,{ad.base_dn}",
+        "Print Operators": f"CN=Print Operators,CN=Builtin,{ad.base_dn}",
+        "Account Operators": f"CN=Account Operators,CN=Builtin,{ad.base_dn}",
+    }
+    
+    risky_members = []
+    all_members = {}
+    
+    for group_name, group_dn in operator_groups.items():
+        members = ad.search(
+            f"(&(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:={group_dn}))",
+            ["sAMAccountName", "adminCount", "userAccountControl"],
+        )
+        
+        all_members[group_name] = []
+        
+        for member in members:
+            name = ad.attr_str(member, "sAMAccountName")
+            admin_count = ad.attr_int(member, "adminCount")
+            uac = ad.attr_int(member, "userAccountControl")
+            
+            all_members[group_name].append(name)
+            
+            # Flag non-admin users in operator groups
+            if admin_count != 1 and not (uac & UAC_DISABLED):
+                risky_members.append(f"{name} in {group_name}")
+        
+        stats[f"operator_group_{group_name.lower().replace(' ', '_')}"] = len(members)
+    
+    stats["operator_group_risky_members"] = len(risky_members)
+    
+    if risky_members:
+        findings.append(
+            F(
+                "Privilege Escalation",
+                "Non-Admin Users in Operator Groups",
+                "HIGH",
+                f"{len(risky_members)} non-admin user(s) in powerful built-in groups. "
+                "Operator groups (Backup Ops, Server Ops, etc.) have implicit privileges.",
+                details=risky_members,
+                recommendation="Remove non-admin users from operator groups unless explicitly needed.",
+                risk_score=12,
+                references=[
+                    "https://attack.mitre.org/techniques/T1098/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Privilege Escalation",
+                "Operator Groups Properly Restricted",
+                "INFO",
+                "No unauthorized users found in operator groups.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 45. Group Nesting Audit -------------------------------------------------------
+
+
+def check_group_nesting(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Group Nesting Audit")
+    
+    priv_groups = {
+        f"CN=Domain Admins,CN=Users,{ad.base_dn}",
+        f"CN=Enterprise Admins,CN=Users,{ad.base_dn}",
+        f"CN=Schema Admins,CN=Users,{ad.base_dn}",
+        f"CN=Administrators,CN=Builtin,{ad.base_dn}",
+    }
+    
+    nested_paths = []
+    
+    try:
+        for priv_dn in priv_groups:
+            # Get direct members
+            direct_members = ad.search(
+                f"(&(objectClass=group)(member={priv_dn}))",
+                ["cn", "distinguishedName"],
+            )
+            
+            for member_group in direct_members:
+                member_dn = ad.attr_str(member_group, "distinguishedName")
+                member_name = ad.attr_str(member_group, "cn")
+                
+                # Get users in this nested group
+                try:
+                    nested_users = ad.search(
+                        f"(&(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:={member_dn})"
+                        f"(!(objectClass=computer)))",
+                        ["sAMAccountName", "adminCount"],
+                    )
+                    
+                    for user in nested_users:
+                        user_name = ad.attr_str(user, "sAMAccountName")
+                        admin_count = ad.attr_int(user, "adminCount")
+                        
+                        # Flag non-admin users with indirect admin access
+                        if admin_count != 1:
+                            priv_group_name = priv_dn.split(",")[0].replace("CN=", "")
+                            nested_paths.append(
+                                f"{user_name} → {member_name} → {priv_group_name}"
+                            )
+                except Exception:
+                    pass
+    
+    except Exception as e:
+        print(f"  [~] Group nesting audit failed: {e}")
+    
+    stats["nested_group_paths"] = len(nested_paths)
+    
+    if nested_paths:
+        findings.append(
+            F(
+                "Privilege Escalation",
+                "Transitive Privileged Group Membership",
+                "HIGH",
+                f"{len(nested_paths)} user(s) have indirect administrative privileges via group nesting. "
+                "These paths may not be visible in direct group membership checks.",
+                details=nested_paths[:10],
+                recommendation="Audit group nesting hierarchy; flatten where possible to reduce complexity.",
+                risk_score=12,
+                references=[
+                    "https://attack.mitre.org/techniques/T1087/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Privilege Escalation",
+                "No Problematic Group Nesting Detected",
+                "INFO",
+                "Group membership hierarchy appears properly structured.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 46. Service Account Passwords in LDAP ----------------------------------------
+
+
+def check_ldap_passwords(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Service Account Passwords in LDAP")
+    
+    # Search for userPassword attribute (legacy/misconfigured accounts)
+    users_with_pwd = ad.search(
+        "(&(objectClass=user)(userPassword=*))",
+        ["sAMAccountName", "adminCount", "userAccountControl"],
+    )
+    
+    stats["users_with_ldap_passwords"] = len(users_with_pwd)
+    
+    if users_with_pwd:
+        details = []
+        admin_count = 0
+        
+        for user in users_with_pwd:
+            name = ad.attr_str(user, "sAMAccountName")
+            is_admin = ad.attr_int(user, "adminCount") == 1
+            
+            details.append(f"{name}" + (" [ADMIN]" if is_admin else ""))
+            if is_admin:
+                admin_count += 1
+        
+        sev = "CRITICAL" if admin_count > 0 else "HIGH"
+        findings.append(
+            F(
+                "Account Security",
+                "Plaintext Passwords Stored in LDAP",
+                sev,
+                f"{len(users_with_pwd)} account(s) have passwords stored in the userPassword attribute. "
+                "These are accessible via LDAP queries and represent a critical security risk.",
+                details=details,
+                recommendation=(
+                    "Immediately remove userPassword attributes. "
+                    "Use gMSA or managed service accounts instead. "
+                    "Audit who accessed these credentials."
+                ),
+                risk_score=20,
+                references=[
+                    "https://ldapwiki.com/wiki/UserPassword"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Account Security",
+                "No Plaintext Passwords in LDAP",
+                "INFO",
+                "No accounts with userPassword attributes detected.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 51. Certificate Templates Without Approval ----------------------------------
+
+
+def check_cert_templates_no_approval(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Certificate Templates Without Approval")
+    
+    pki_base = f"CN=Public Key Services,CN=Services,{ad.config_dn}"
+    tmpl_base = f"CN=Certificate Templates,{pki_base}"
+    
+    try:
+        templates = ad.search(
+            "(objectClass=pKICertificateTemplate)",
+            ["cn", "msPKI-Enrollment-Flag"],
+            base=tmpl_base,
+        )
+    except Exception:
+        findings.append(
+            F(
+                "ADCS",
+                "ADCS Not Accessible",
+                "INFO",
+                "Certificate Services infrastructure not detected.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    if not templates:
+        findings.append(
+            F(
+                "ADCS",
+                "No Certificate Templates Found",
+                "INFO",
+                "No templates detected.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    stats["cert_templates_total"] = len(templates)
+    
+    # CT_FLAG_PEND_ALL_REQUESTS = 0x00000002
+    PEND_ALL = 0x00000002
+    
+    no_approval = []
+    
+    for tmpl in templates:
+        name = ad.attr_str(tmpl, "cn")
+        
+        if name in _CA_TYPE_TEMPLATES:
+            continue
+        
+        ef = ad.attr_int(tmpl, "msPKI-Enrollment-Flag")
+        
+        # Flag templates that don't require approval
+        if not (ef & PEND_ALL):
+            no_approval.append(name)
+    
+    stats["templates_no_approval"] = len(no_approval)
+    
+    if no_approval:
+        findings.append(
+            F(
+                "ADCS",
+                "Certificate Templates Without Approval Requirement",
+                "HIGH",
+                f"{len(no_approval)} template(s) allow instant issuance without manager approval. "
+                "This complements ESC2/ESC3 findings and can enable privilege escalation.",
+                details=no_approval,
+                recommendation="Enable CT_FLAG_PEND_ALL_REQUESTS on all sensitive templates.",
+                risk_score=15,
+                references=[
+                    "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "ADCS",
+                "Certificate Templates Require Approval",
+                "INFO",
+                f"All {len(templates)} certificate template(s) require manager approval.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 52. Disabled Default GPOs -----------------------------------------------
+
+
+def check_disabled_default_gpos(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Disabled Default GPOs")
+    
+    # Check for disabled Default Domain Policy
+    default_policies = ad.search(
+        "(&(objectClass=groupPolicyContainer)(cn=Default*))",
+        ["cn", "flags"],
+        base=f"CN=Policies,CN=System,{ad.base_dn}",
+    )
+    
+    # GPO flags: bit 0x00000001 = DISABLED
+    DISABLED_FLAG = 0x00000001
+    
+    disabled_gpos = []
+    
+    for gpo in default_policies:
+        name = ad.attr_str(gpo, "cn")
+        flags = ad.attr_int(gpo, "flags")
+        
+        if flags & DISABLED_FLAG:
+            disabled_gpos.append(name)
+    
+    stats["disabled_default_gpos"] = len(disabled_gpos)
+    
+    if disabled_gpos:
+        findings.append(
+            F(
+                "Group Policy",
+                "Default Domain/DC Security Policies Disabled",
+                "MEDIUM",
+                f"{len(disabled_gpos)} default GPO(s) are disabled. "
+                "Baseline domain security settings may not be enforced.",
+                details=disabled_gpos,
+                recommendation=(
+                    "Re-enable disabled default GPOs. "
+                    "If modifications are needed, create custom GPOs instead of disabling defaults."
+                ),
+                risk_score=8,
+                references=[
+                    "https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-policy/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Group Policy",
+                "Default Policies Enabled",
+                "INFO",
+                "All default domain security policies are enabled.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 42. Computer Object Write Permissions (ESC5 Equivalent) --------------------
+
+
+def check_computer_write_acl(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Computer Object Write Permissions")
+    
+    # Get domain SID for privilege checks
+    domain_sid = _get_domain_sid(ad)
+    
+    # Search all computer objects
+    computers = ad.search(
+        "(objectClass=computer)",
+        ["cn", "distinguishedName"],
+        size_limit=10000,
+    )
+    
+    stats["computers_total"] = len(computers)
+    risky_computers = []
+    
+    if not computers:
+        findings.append(
+            F(
+                "Access Control",
+                "No Computers Found",
+                "INFO",
+                "No computer objects detected.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    for computer in computers:
+        comp_name = ad.attr_str(computer, "cn")
+        comp_dn = ad.attr_str(computer, "distinguishedName")
+        
+        try:
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=comp_dn,
+                search_filter="(objectClass=computer)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            
+            for ace in aces:
+                if ace["ace_type"] not in (0x00, 0x05, 0x06):
+                    continue
+                
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                if not _sid_is_privileged(sid, domain_sid):
+                    if mask & (AM_GENERIC_ALL | AM_GENERIC_WRITE | AM_WRITE_PROP):
+                        resolved = ad.resolve_sid(sid)
+                        risky_computers.append(f"{comp_name} → {resolved}")
+                        break
+        
+        except Exception as e:
+            print(f"  [~] Computer ACL check failed for {comp_name}: {e}")
+            continue
+    
+    stats["computers_with_risky_acl"] = len(risky_computers)
+    
+    if risky_computers:
+        findings.append(
+            F(
+                "Access Control",
+                "Computer Objects with Non-Admin Write ACL",
+                "CRITICAL",
+                f"{len(risky_computers)} computer object(s) allow non-admin principals to modify attributes. "
+                "This enables credential injection, OS switching, or resource-based delegation attacks.",
+                details=risky_computers[:20],
+                recommendation="Restrict computer object ACLs to Domain Admins and SYSTEM.",
+                risk_score=18,
+                references=[
+                    "https://attack.mitre.org/techniques/T1098/",
+                    "https://exploit.ph/active-directory-acl-attack-paths.html"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Access Control",
+                "Computer Objects Properly Protected",
+                "INFO",
+                f"All {len(computers)} computer objects have secure ACLs.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 47. Generic Write on Containers -----------------------------------------------
+
+
+def check_container_generic_write(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Container Generic Write")
+    
+    domain_sid = _get_domain_sid(ad)
+    
+    # Search for container objects with risky ACLs
+    containers = ad.search(
+        "(objectClass=container)",
+        ["cn", "distinguishedName"],
+        size_limit=5000,
+    )
+    
+    stats["containers_total"] = len(containers)
+    risky_containers = []
+    
+    for container in containers:
+        cont_name = ad.attr_str(container, "cn")
+        cont_dn = ad.attr_str(container, "distinguishedName")
+        
+        # Skip system containers
+        if any(x in cont_dn for x in ["System", "LostAndFound", "Infrastructure"]):
+            continue
+        
+        try:
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=cont_dn,
+                search_filter="(objectClass=container)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            
+            for ace in aces:
+                if ace["ace_type"] not in (0x00, 0x05, 0x06):
+                    continue
+                
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                if not _sid_is_privileged(sid, domain_sid):
+                    if mask & AM_GENERIC_ALL:
+                        resolved = ad.resolve_sid(sid)
+                        risky_containers.append(f"{cont_name} → {resolved}")
+                        break
+        
+        except Exception as e:
+            print(f"  [~] Container ACL check failed for {cont_name}: {e}")
+            continue
+    
+    stats["containers_with_generic_write"] = len(risky_containers)
+    
+    if risky_containers:
+        findings.append(
+            F(
+                "Access Control",
+                "Containers with Generic Write ACL",
+                "HIGH",
+                f"{len(risky_containers)} container(s) allow non-admin principals full control. "
+                "This enables bulk object creation, deletion, or modification attacks.",
+                details=risky_containers[:10],
+                recommendation="Restrict container ACLs to domain administrators.",
+                risk_score=14,
+                references=[
+                    "https://exploit.ph/active-directory-acl-attack-paths.html"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Access Control",
+                "Containers Properly Protected",
+                "INFO",
+                f"Scanned {len(containers)} container(s); none with concerning ACLs.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 48. Never-Expiring Computer Passwords ----------------------------------------
+
+
+def check_never_expiring_computer_passwords(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Never-Expiring Computer Passwords")
+    
+    # Computer objects with pwdLastSet=0 indicate never-expiring passwords
+    # (in AD, pwdLastSet=0 means password was never set on computer account)
+    # Contrary to intuition, computer passwords should rotate (~30 days)
+    
+    computers = ad.search(
+        "(&(objectClass=computer)(userAccountControl=*))",
+        ["cn", "pwdLastSet", "userAccountControl"],
+        size_limit=5000,
+    )
+    
+    stats["computers_checked"] = len(computers)
+    
+    # Check for old password ages (> 90 days without change)
+    import time
+    current_time = time.time()
+    filetime_now = int((current_time + 11644473600) * 10000000)
+    
+    old_passwords = []
+    
+    for computer in computers:
+        comp_name = ad.attr_str(computer, "cn")
+        pwd_last_set = ad.attr_int(computer, "pwdLastSet")
+        uac = ad.attr_int(computer, "userAccountControl")
+        
+        # Skip disabled computers
+        if uac & UAC_DISABLED:
+            continue
+        
+        if pwd_last_set == 0:
+            # pwdLastSet=0 might mean never set (potentially problematic)
+            old_passwords.append(f"{comp_name} [NEVER SET]")
+        else:
+            # Calculate age in days
+            filetime_pwd = pwd_last_set
+            age_seconds = (filetime_now - filetime_pwd) / 10000000
+            age_days = age_seconds / 86400
+            
+            if age_days > 90:  # Default computer password should rotate ~30 days
+                old_passwords.append(f"{comp_name} [{int(age_days)} days old]")
+    
+    stats["computers_old_passwords"] = len(old_passwords)
+    
+    if old_passwords:
+        findings.append(
+            F(
+                "Account Security",
+                "Computer Accounts with Old or Never-Set Passwords",
+                "MEDIUM-HIGH",
+                f"{len(old_passwords)} computer account(s) have not changed password recently. "
+                "This may indicate disabled systems or accounts vulnerable to password spraying.",
+                details=old_passwords[:15],
+                recommendation="Review and re-image old computer accounts; enable periodic password changes.",
+                risk_score=10,
+                references=[
+                    "https://attack.mitre.org/techniques/T1078/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Account Security",
+                "Computer Passwords Rotate Normally",
+                "INFO",
+                f"All {len(computers)} active computer accounts have recent password changes.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 49. Disabled Admin Accounts --------------------------------------------------
+
+
+def check_disabled_admin_accounts(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Disabled Admin Accounts")
+    
+    # Find disabled accounts with adminCount=1
+    disabled_admins = ad.search(
+        "(&(objectClass=user)(adminCount=1)(userAccountControl:1.2.840.113556.1.4.803:=2))",
+        ["sAMAccountName", "pwdLastSet", "displayName", "description"],
+    )
+    
+    stats["disabled_admin_accounts"] = len(disabled_admins)
+    
+    # Separate into categories
+    stale_disabled = []  # Disabled for >1 year
+    recently_disabled = []  # Disabled within 1 year
+    
+    import time
+    current_time = time.time()
+    filetime_now = int((current_time + 11644473600) * 10000000)
+    one_year_seconds = 365 * 86400
+    
+    for account in disabled_admins:
+        name = ad.attr_str(account, "sAMAccountName")
+        pwd_last_set = ad.attr_int(account, "pwdLastSet")
+        display = ad.attr_str(account, "displayName") or ""
+        desc = ad.attr_str(account, "description") or ""
+        
+        if pwd_last_set > 0:
+            age_seconds = (filetime_now - pwd_last_set) / 10000000
+            if age_seconds > one_year_seconds:
+                stale_disabled.append(f"{name} (last set {int(age_seconds/86400)} days ago)")
+            else:
+                recently_disabled.append(name)
+        else:
+            recently_disabled.append(f"{name} (never set)")
+    
+    stats["disabled_admin_stale"] = len(stale_disabled)
+    stats["disabled_admin_recent"] = len(recently_disabled)
+    
+    if stale_disabled or recently_disabled:
+        findings.append(
+            F(
+                "Account Hygiene",
+                "Disabled Administrative Accounts",
+                "MEDIUM",
+                f"{len(disabled_admins)} disabled admin account(s) found. "
+                f"{len(stale_disabled)} are stale (>1 year). "
+                "These accounts clutter the directory and may harbor dormant threats.",
+                details=(stale_disabled + recently_disabled)[:15],
+                recommendation="Remove or archive disabled admin accounts after 1-2 years of inactivity.",
+                risk_score=8,
+                references=[
+                    "https://attack.mitre.org/techniques/T1087/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Account Hygiene",
+                "No Disabled Admin Accounts Found",
+                "INFO",
+                "Administrative account inventory is clean.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 50. Group Policy Object Write ACL (GPO Control) ----------------------------
+
+
+def check_gpo_write_acl(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Group Policy Object Write ACL")
+    
+    domain_sid = _get_domain_sid(ad)
+    
+    # Search all GPOs
+    gpo_container = f"CN=Policies,CN=System,{ad.base_dn}"
+    gpos = ad.search(
+        "(objectClass=groupPolicyContainer)",
+        ["cn", "displayName", "distinguishedName"],
+        base=gpo_container,
+        size_limit=5000,
+    )
+    
+    stats["gpos_total"] = len(gpos)
+    risky_gpos = []
+    
+    if not gpos:
+        findings.append(
+            F(
+                "Group Policy",
+                "No Group Policies Found",
+                "INFO",
+                "No GPOs detected in the domain.",
+                risk_score=0,
+            )
+        )
+        return findings, stats
+    
+    for gpo in gpos:
+        gpo_name = ad.attr_str(gpo, "displayName") or ad.attr_str(gpo, "cn")
+        gpo_dn = ad.attr_str(gpo, "distinguishedName")
+        
+        # Skip default system GPOs
+        if any(x in gpo_name for x in ["Default Domain Policy", "Default Domain Controllers"]):
+            continue
+        
+        try:
+            from ldap3 import BASE
+            from ldap3.protocol.microsoft import security_descriptor_control
+            
+            ctrl = security_descriptor_control(sdflags=0x04)
+            ad.conn.search(
+                search_base=gpo_dn,
+                search_filter="(objectClass=groupPolicyContainer)",
+                search_scope=BASE,
+                attributes=["nTSecurityDescriptor"],
+                controls=ctrl,
+            )
+            
+            if not ad.conn.entries:
+                continue
+            
+            sd_attr = getattr(ad.conn.entries[0], "nTSecurityDescriptor", None)
+            raw_sd = sd_attr.raw_values[0] if (sd_attr and sd_attr.raw_values) else None
+            
+            if not raw_sd:
+                continue
+            
+            aces = _parse_sd(raw_sd)
+            
+            for ace in aces:
+                if ace["ace_type"] not in (0x00, 0x05, 0x06):
+                    continue
+                
+                sid = ace["trustee_sid"]
+                mask = ace["access_mask"]
+                
+                if not _sid_is_privileged(sid, domain_sid):
+                    if mask & (AM_GENERIC_ALL | AM_GENERIC_WRITE | AM_WRITE_PROP):
+                        resolved = ad.resolve_sid(sid)
+                        risky_gpos.append(f"{gpo_name} → {resolved}")
+                        break
+        
+        except Exception as e:
+            print(f"  [~] GPO ACL check failed for {gpo_name}: {e}")
+            continue
+    
+    stats["gpos_with_write_acl"] = len(risky_gpos)
+    
+    if risky_gpos:
+        findings.append(
+            F(
+                "Group Policy",
+                "Group Policy Objects with Write ACL",
+                "CRITICAL",
+                f"{len(risky_gpos)} GPO(s) allow non-admin principals to modify group policies. "
+                "This enables domain-wide configuration attacks affecting hundreds of computers.",
+                details=risky_gpos[:10],
+                recommendation="Restrict GPO ACLs to Domain Admins and Group Policy Creator Owners only.",
+                risk_score=20,
+                references=[
+                    "https://attack.mitre.org/techniques/T1484/",
+                    "https://exploit.ph/active-directory-acl-attack-paths.html"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Group Policy",
+                "Group Policy Objects Properly Protected",
+                "INFO",
+                f"All {len(gpos)} GPOs have secure ACLs.",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
+# -- 53. Azure AD Connect Service Accounts ----------------------------------------
+
+
+def check_aad_connect_accounts(ad: ADConnector) -> Tuple[List[F], Dict]:
+    findings, stats = [], {}
+    print("  [*] Azure AD Connect Service Accounts")
+    
+    # AAD Connect creates hidden accounts and sync connectors
+    # Common patterns: MSOL_* accounts, ADSync* service accounts
+    
+    # Search for MSOL accounts (direct sync account)
+    msol_accounts = ad.search(
+        "(sAMAccountName=MSOL_*)",
+        ["sAMAccountName", "userAccountControl", "pwdLastSet", "description"],
+    )
+    
+    # Search for ADSync and related accounts
+    adsync_accounts = ad.search(
+        "|(sAMAccountName=ADSync*)(sAMAccountName=ADSYNC*)",
+        ["sAMAccountName", "userAccountControl", "pwdLastSet", "description"],
+    )
+    
+    # Search for Sync Admin account (typically created by AAD Connect)
+    sync_admin = ad.search(
+        "(&(objectClass=user)(|(cn=*Sync*)(sAMAccountName=*Sync*)))",
+        ["sAMAccountName", "memberOf", "adminCount"],
+        size_limit=100,
+    )
+    
+    # Get group memberships
+    aad_connect_accounts = []
+    risky_perms = []
+    
+    all_aad_accounts = msol_accounts + adsync_accounts + sync_admin
+    stats["aad_connect_accounts_total"] = len(all_aad_accounts)
+    
+    for account in all_aad_accounts:
+        acc_name = ad.attr_str(account, "sAMAccountName")
+        uac = ad.attr_int(account, "userAccountControl")
+        admin_count = ad.attr_int(account, "adminCount")
+        desc = ad.attr_str(account, "description") or ""
+        
+        # Confirm it's actually AAD Connect related
+        is_aad_related = (
+            "MSOL" in acc_name or 
+            "ADSync" in acc_name or 
+            "aad" in desc.lower() or
+            "azure" in desc.lower()
+        )
+        
+        if not is_aad_related:
+            continue
+        
+        aad_connect_accounts.append(acc_name)
+        
+        # Check for concerning permissions
+        if admin_count == 1:
+            risky_perms.append(f"{acc_name} [HAS adminCount=1]")
+        elif not (uac & UAC_PASSWORD_NOTREQD):
+            # AAD Sync accounts shouldn't require password changes
+            if uac & UAC_DONT_EXPIRE_PASSWORD:
+                risky_perms.append(f"{acc_name} [Password doesn't expire]")
+    
+    stats["aad_connect_accounts_found"] = len(aad_connect_accounts)
+    stats["aad_connect_risky_perms"] = len(risky_perms)
+    
+    if len(aad_connect_accounts) > 0:
+        msg = f"Found {len(aad_connect_accounts)} Azure AD Connect service account(s). "
+        if risky_perms:
+            msg += f"{len(risky_perms)} have concerning permissions."
+            sev = "HIGH"
+            score = 12
+        else:
+            msg += "Permissions appear appropriate."
+            sev = "MEDIUM"
+            score = 8
+        
+        findings.append(
+            F(
+                "Cloud Integration",
+                "Azure AD Connect Service Accounts Detected",
+                sev,
+                msg + " "
+                "AAD Connect accounts enable on-premises AD ↔ Azure AD sync. "
+                "Compromise of these accounts affects all cloud identities.",
+                details=aad_connect_accounts + risky_perms,
+                recommendation=(
+                    "Ensure AAD Connect accounts are isolated; "
+                    "monitor for unexpected privilege escalation; "
+                    "audit sync agent access logs; "
+                    "consider using managed identities where possible."
+                ),
+                risk_score=score,
+                references=[
+                    "https://docs.microsoft.com/en-us/azure/active-directory/hybrid/reference-connect-accounts-permissions",
+                    "https://attack.mitre.org/techniques/T1098/"
+                ],
+            )
+        )
+    else:
+        findings.append(
+            F(
+                "Cloud Integration",
+                "No Azure AD Connect Detected",
+                "INFO",
+                "No AAD Connect service accounts found (hybrid setup not detected).",
+                risk_score=0,
+            )
+        )
+    
+    return findings, stats
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AGGREGATOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5073,6 +6154,21 @@ def run_all_checks(ad: ADConnector):
         check_bitlocker_recovery_keys,
         check_llmnr_mdns_boundary,
         check_esc12_temporary_certs,
+        # Phase 1 (checks 43-46, 51-52)
+        check_cert_template_write_acl,
+        check_operator_groups,
+        check_group_nesting,
+        check_ldap_passwords,
+        check_cert_templates_no_approval,
+        check_disabled_default_gpos,
+        # Phase 2 (checks 42, 47-49)
+        check_computer_write_acl,
+        check_container_generic_write,
+        check_never_expiring_computer_passwords,
+        check_disabled_admin_accounts,
+        # Phase 3 (checks 50, 53)
+        check_gpo_write_acl,
+        check_aad_connect_accounts,
     ]
 
     for fn in checks:
